@@ -1,59 +1,70 @@
 import asyncio
-import streamlit as st
-import edge_tts
-from pypdf import PdfReader
 import os
+import re
+from flask import Flask, render_template, request, send_file, flash, redirect
+from pypdf import PdfReader
+import edge_tts
 
-st.set_page_config(page_title="PDF to MP3 Converter", layout="centered")
-st.title("Convertitore PDF in Audio (Voci Microsoft Edge)")
-st.write("Carica il tuo file PDF per scaricare l'intero audiolibro in MP3.")
+app = Flask(__name__)
+app.secret_key = "supersecretkey"
 
-opzioni_voci = {
-    "Elsa (Voce Femminile Naturale)": "it-IT-ElsaNeural",
-    "Diego (Voce Maschile Naturale)": "it-IT-DiegoNeural",
-    "Isabella (Alternativa Femminile)": "it-IT-IsabellaNeural"
-}
-scelta_utente = st.selectbox("Scegli la voce che preferisci:", list(opzioni_voci.keys()))
-voce_selezionata = opzioni_voci[scelta_utente]
+# L'ambiente Serverless di Vercel permette la scrittura solo dentro /tmp
+UPLOAD_FOLDER = "/tmp"
 
-uploaded_file = st.file_uploader("Trascina o seleziona il file PDF qui", type=["pdf"])
+async def generate_audio_async(text, voice, output_path):
+    communicate = edge_tts.Communicate(text, voice)
+    await communicate.save(output_path)
 
-if uploaded_file is not None:
-    st.info("Estrazione del testo dal PDF in corso...")
-    
-    try:
-        reader = PdfReader(uploaded_file)
-        testo_completo = ""
+def clean_text(text):
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'\.([^\s])', r'. \1', text)
+    return text.strip()
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if request.method == "POST":
+        if "file" not in request.files:
+            flash("Nessun file selezionato")
+            return redirect(request.url)
         
-        for pagina in reader.pages:
-            testo_pagina = pagina.extract_text()
-            if testo_pagina:
-                testo_completo += testo_pagina + " "
+        file = request.files["file"]
+        if file.filename == "":
+            flash("Nessun file selezionato")
+            return redirect(request.url)
         
-        if len(testo_completo.strip()) == 0:
-            st.error("Non è stato possibile estrarre testo dal PDF. Assicurati che non sia una semplice scansione di immagini.")
-        else:
-            st.success(f"Testo estratto con successo! Totale caratteri: {len(testo_completo)}")
-            
-            if st.button("Avvia Conversione in MP3"):
-                nome_file_audio = "audiolibro_generato.mp3"
+        if file and file.filename.lower().endswith(".pdf"):
+            try:
+                reader = PdfReader(file)
+                testo_completo = ""
+                for page in reader.pages:
+                    text_page = page.extract_text()
+                    if text_page:
+                        testo_completo += text_page + " "
                 
-                with st.spinner("Generazione del file MP3..."):
-                    # Questo risolve il bug del freeze con Python 3.13
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    communicate = edge_tts.Communicate(testo_completo, voce_selezionata)
-                    loop.run_until_complete(communicate.save(nome_file_audio))
-                    loop.close()
+                testo_pulito = clean_text(testo_completo)
                 
-                if os.path.exists(nome_file_audio):
-                    st.success("Audio generato con successo!")
-                    with open(nome_file_audio, "rb") as file:
-                        st.download_button(
-                            label="📥 SCARICA IL FILE MP3",
-                            data=file,
-                            file_name="il_tuo_audiolibro.mp3",
-                            mime="audio/mp3"
-                        )
-    except Exception as e:
-        st.error(f"Si è verificato un errore: {e}")
+                if not testo_pulito:
+                    flash("Impossibile estrarre testo dal PDF. Controlla che non sia un'immagine.")
+                    return redirect(request.url)
+                
+                voice = request.form.get("voice", "it-IT-ElsaNeural")
+                output_filename = "audiolibro.mp3"
+                output_path = os.path.join(UPLOAD_FOLDER, output_filename)
+                
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(generate_audio_async(testo_pulito, voice, output_path))
+                loop.close()
+                
+                if os.path.exists(output_path):
+                    return send_file(output_path, as_attachment=True, download_name="il_tuo_audiolibro.mp3", mimetype="audio/mp3")
+                else:
+                    flash("Errore nella generazione del file audio.")
+            except Exception as e:
+                flash(f"Si è verificato un errore: {str(e)}")
+                return redirect(request.url)
+                
+    return render_template("index.html")
